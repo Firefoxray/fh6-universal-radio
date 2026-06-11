@@ -194,6 +194,10 @@ void SpotifySource::start_pipe_locked() {
     SetEnvironmentVariableW(L"RUST_LOG",
                             L"librespot_playback::player=debug,librespot_metadata=trace");
 
+    log::info("[spotify] starting librespot via {}: librespot={}, ffmpeg={}, cache={}",
+              (worker_ && worker_->alive()) ? "worker" : "direct", subprocess::narrow(spot),
+              subprocess::narrow(ff), cfg_.cache_dir.string());
+
     if (worker_ && worker_->alive()) {
         // spawn the pipeline via worker_client
         // use meta_stderr_idx = 0 to capture librespot stderr directly
