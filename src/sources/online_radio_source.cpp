@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <algorithm>
+#include <cctype>
 
 namespace fh6::sources {
 
@@ -16,6 +17,90 @@ using subprocess::spawn_in_job;
 using subprocess::widen;
 
 constexpr std::uint64_t kPcmBytesPerSec = 48000ull * 2ull * 2ull;
+
+std::string trim_meta_value(std::string raw) {
+    size_t start = 0;
+    while (start < raw.size() &&
+           (raw[start] == '\'' || raw[start] == '"' || raw[start] == ' ' || raw[start] == '\t'))
+        ++start;
+    if (start > 0) raw = raw.substr(start);
+    while (!raw.empty() && (raw.back() == '\'' || raw.back() == '"' || raw.back() == ';' ||
+                            raw.back() == ' ' || raw.back() == '\t'))
+        raw.pop_back();
+    return raw;
+}
+
+std::string trim_meta_field(std::string raw) {
+    size_t start = raw.find_first_not_of(" \t");
+    if (start == std::string::npos) return {};
+    size_t end = raw.find_last_not_of(" \t");
+    return raw.substr(start, end - start + 1);
+}
+
+std::string trim_iheart_artist_prefix(std::string raw) {
+    raw = trim_meta_field(std::move(raw));
+    const auto strip_suffix = [&](std::string_view suffix) {
+        if (raw.size() >= suffix.size() &&
+            raw.compare(raw.size() - suffix.size(), suffix.size(), suffix.data(), suffix.size()) == 0) {
+            raw.erase(raw.size() - suffix.size());
+            raw = trim_meta_field(std::move(raw));
+            return true;
+        }
+        return false;
+    };
+    strip_suffix("-") || strip_suffix("–") || strip_suffix("—");
+    return raw;
+}
+
+bool find_quoted_attr(std::string_view raw, std::string_view key, std::string& value,
+                      size_t* attr_pos = nullptr) {
+    size_t pos = 0;
+    while ((pos = raw.find(key, pos)) != std::string_view::npos) {
+        const bool has_left_boundary =
+            pos == 0 || std::isspace(static_cast<unsigned char>(raw[pos - 1]));
+        const size_t eq_pos = pos + key.size();
+        if (has_left_boundary && eq_pos + 1 < raw.size() && raw[eq_pos] == '=' &&
+            raw[eq_pos + 1] == '"') {
+            const size_t value_start = eq_pos + 2;
+            const size_t value_end   = raw.find('"', value_start);
+            if (value_end == std::string_view::npos) return false;
+            value = std::string{raw.substr(value_start, value_end - value_start)};
+            if (attr_pos) *attr_pos = pos;
+            return true;
+        }
+        pos += key.size();
+    }
+    return false;
+}
+
+struct ParsedIcyTitle {
+    bool has_metadata = false;
+    bool should_apply = true;
+    std::string artist;
+    std::string title;
+};
+
+ParsedIcyTitle parse_icy_stream_title(const std::string& raw) {
+    ParsedIcyTitle parsed;
+
+    std::string song_spot;
+    if (find_quoted_attr(raw, "song_spot", song_spot) && song_spot != "M") {
+        parsed.has_metadata = true;
+        parsed.should_apply = false;
+        return parsed;
+    }
+
+    std::string text;
+    size_t text_pos = std::string::npos;
+    if (find_quoted_attr(raw, "text", text, &text_pos)) {
+        parsed.has_metadata = true;
+        parsed.artist       = trim_iheart_artist_prefix(raw.substr(0, text_pos));
+        parsed.title        = trim_meta_field(std::move(text));
+        return parsed;
+    }
+
+    return parsed;
+}
 } // namespace
 
 struct OnlineRadioSource::Pipe {
@@ -279,19 +364,6 @@ void OnlineRadioSource::pump(RingBuffer& ring) {
             p->stderr_buf.append(buf, got);
         }
 
-        // strip surrounding quotes/separators/whitespace from a raw tag value
-        const auto clean_value = [](std::string raw) {
-            size_t start = 0;
-            while (start < raw.size() &&
-                   (raw[start] == '\'' || raw[start] == '"' || raw[start] == ' ' || raw[start] == '\t'))
-                ++start;
-            if (start > 0) raw = raw.substr(start);
-            while (!raw.empty() && (raw.back() == '\'' || raw.back() == '"' || raw.back() == ';' ||
-                                    raw.back() == ' ' || raw.back() == '\t'))
-                raw.pop_back();
-            return raw;
-        };
-
         // split "Artist - Title"; returns true when the separator was present.
         // when absent, only `title` is written (the caller decides the artist).
         const auto split_dash = [](const std::string& raw, std::string& artist, std::string& title) {
@@ -345,12 +417,17 @@ void OnlineRadioSource::pump(RingBuffer& ring) {
             if (size_t icy_idx = payload.find("StreamTitle="); icy_idx != std::string::npos) {
                 size_t val_start = icy_idx + 12;
                 size_t val_end   = payload.find(';', val_start);
-                std::string raw  = clean_value(payload.substr(
+                std::string raw  = trim_meta_value(payload.substr(
                     val_start, val_end != std::string::npos ? val_end - val_start : std::string::npos));
                 if (!raw.empty()) {
-                    std::string artist, title;
-                    split_dash(raw, artist, title);
-                    apply_meta(artist, title, "ICY");
+                    const auto parsed = parse_icy_stream_title(raw);
+                    if (parsed.has_metadata) {
+                        if (parsed.should_apply) apply_meta(parsed.artist, parsed.title, "ICY");
+                    } else {
+                        std::string artist, title;
+                        split_dash(raw, artist, title);
+                        apply_meta(artist, title, "ICY");
+                    }
                 }
                 continue;
             }
@@ -367,14 +444,19 @@ void OnlineRadioSource::pump(RingBuffer& ring) {
             std::transform(key.begin(), key.end(), key.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-            std::string raw = clean_value(payload.substr(colon_idx + 1));
+            std::string raw = trim_meta_value(payload.substr(colon_idx + 1));
             if (raw.empty()) continue;
 
             if (key.find("streamtitle") != std::string::npos ||
                 key.find("icy-name") != std::string::npos) {
-                std::string artist, title;
-                split_dash(raw, artist, title);
-                apply_meta(artist, title, "Tag");
+                const auto parsed = parse_icy_stream_title(raw);
+                if (parsed.has_metadata) {
+                    if (parsed.should_apply) apply_meta(parsed.artist, parsed.title, "Tag");
+                } else {
+                    std::string artist, title;
+                    split_dash(raw, artist, title);
+                    apply_meta(artist, title, "Tag");
+                }
             } else if (key == "title" || key == "tit2") {
                 // keep any artist already parsed when this tag has no "Artist - Title" form
                 std::string artist = current_artist_, title;
