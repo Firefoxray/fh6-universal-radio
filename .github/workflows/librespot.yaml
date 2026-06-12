@@ -8,6 +8,8 @@ name: librespot
 # That keeps the normal librespot/Symphonia Ogg/Vorbis decoder path available for
 # `--backend pipe --format S16 --dither none`. A passthrough build is still kept
 # as a separate artifact/asset for experiments that pipe Ogg/Vorbis externally.
+# A full-Symphonia decoded-PCM artifact is built from patched source for probing
+# container/decoder coverage without changing the app-side no-passthrough path.
 
 on:
   workflow_dispatch:
@@ -44,6 +46,52 @@ jobs:
             throw "Decoded PCM build unexpectedly exposes --passthrough"
           }
 
+      - name: Build decoded PCM librespot with expanded Symphonia support
+        shell: pwsh
+        run: |
+          git clone --branch "v$env:LIBRESPOT_VERSION" --depth 1 https://github.com/librespot-org/librespot.git librespot-full-symphonia
+
+          $playbackToml = "librespot-full-symphonia\playback\Cargo.toml"
+          $text = Get-Content $playbackToml -Raw
+          $pattern = '(?s)(symphonia\s*=\s*\{[^}]*?features\s*=\s*)\[[^\]]*\]([^}]*\})'
+          $features = '["aac", "isomp4", "mkv", "mp3", "ogg", "vorbis", "flac", "pcm", "wav"]'
+          $regex = [regex]::new($pattern)
+          if (-not $regex.IsMatch($text)) {
+            throw "Could not find the symphonia dependency features in playback/Cargo.toml"
+          }
+
+          $patched = $regex.Replace($text, '$1' + $features + '$2', 1)
+          Set-Content -Path $playbackToml -Value $patched -NoNewline
+          git -C librespot-full-symphonia diff -- playback/Cargo.toml
+
+          Push-Location librespot-full-symphonia
+          $lock = Get-Content Cargo.lock -Raw
+          $symphonia = [regex]::Match($lock, '(?ms)^\[\[package\]\]\s+name = "symphonia"\s+version = "([^"]+)"')
+          if (-not $symphonia.Success) {
+            throw "Could not find symphonia in Cargo.lock"
+          }
+
+          $symphoniaVersion = $symphonia.Groups[1].Value
+          Write-Host "cargo update -p symphonia --precise $symphoniaVersion"
+          cargo update -p symphonia --precise $symphoniaVersion
+          Write-Host "cargo install --path . --locked --root ..\staging-full-symphonia"
+          cargo install --path . --locked --root ..\staging-full-symphonia
+          Pop-Location
+
+      - name: Verify full-Symphonia decoded PCM build
+        shell: pwsh
+        run: |
+          .\staging-full-symphonia\bin\librespot.exe --version
+          $help = .\staging-full-symphonia\bin\librespot.exe --help
+          foreach ($needle in "--backend", "--format", "--dither") {
+            if (-not ($help | Select-String -SimpleMatch $needle -Quiet)) {
+              throw "Full-Symphonia decoded PCM build is missing $needle"
+            }
+          }
+          if ($help | Select-String -SimpleMatch "--passthrough" -Quiet) {
+            throw "Full-Symphonia decoded PCM build unexpectedly exposes --passthrough"
+          }
+
       - name: Build passthrough librespot
         shell: pwsh
         run: |
@@ -62,8 +110,9 @@ jobs:
       - name: Stage binaries
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force artifacts\decoded-pcm, artifacts\passthrough, artifacts\release
+          New-Item -ItemType Directory -Force artifacts\decoded-pcm, artifacts\full-symphonia, artifacts\passthrough, artifacts\release
           Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\decoded-pcm\librespot.exe
+          Copy-Item staging-full-symphonia\bin\librespot.exe artifacts\full-symphonia\librespot.exe
           Copy-Item staging-passthrough\bin\librespot.exe artifacts\passthrough\librespot.exe
           Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\release\librespot.exe
           Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\release\librespot-decoded-pcm.exe
@@ -73,6 +122,11 @@ jobs:
         with:
           name: librespot-windows-decoded-pcm
           path: artifacts/decoded-pcm/librespot.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: librespot-windows-decoded-pcm-full-symphonia
+          path: artifacts/full-symphonia/librespot.exe
 
       - uses: actions/upload-artifact@v4
         with:
