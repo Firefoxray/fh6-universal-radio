@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <algorithm>
+#include <array>
 #include <cctype>
 
 namespace fh6::sources {
@@ -52,18 +53,24 @@ std::string trim_iheart_artist_prefix(std::string raw) {
     return raw;
 }
 
-bool find_quoted_attr(std::string_view raw, std::string_view key, std::string& value,
-                      size_t* attr_pos = nullptr) {
+bool find_attr(std::string_view raw, std::string_view key, std::string& value,
+               size_t* attr_pos = nullptr) {
     size_t pos = 0;
     while ((pos = raw.find(key, pos)) != std::string_view::npos) {
         const bool has_left_boundary =
             pos == 0 || std::isspace(static_cast<unsigned char>(raw[pos - 1]));
         const size_t eq_pos = pos + key.size();
-        if (has_left_boundary && eq_pos + 1 < raw.size() && raw[eq_pos] == '=' &&
-            raw[eq_pos + 1] == '"') {
-            const size_t value_start = eq_pos + 2;
-            const size_t value_end   = raw.find('"', value_start);
-            if (value_end == std::string_view::npos) return false;
+        if (has_left_boundary && eq_pos < raw.size() && raw[eq_pos] == '=') {
+            size_t value_start = eq_pos + 1;
+            size_t value_end   = std::string_view::npos;
+            if (value_start < raw.size() && raw[value_start] == '"') {
+                ++value_start;
+                value_end = raw.find('"', value_start);
+                if (value_end == std::string_view::npos) return false;
+            } else {
+                value_end = raw.find_first_of(" \t;", value_start);
+                if (value_end == std::string_view::npos) value_end = raw.size();
+            }
             value = std::string{raw.substr(value_start, value_end - value_start)};
             if (attr_pos) *attr_pos = pos;
             return true;
@@ -75,16 +82,58 @@ bool find_quoted_attr(std::string_view raw, std::string_view key, std::string& v
 
 struct ParsedIcyTitle {
     bool has_metadata = false;
+    bool has_iheart_attrs = false;
     bool should_apply = true;
     std::string artist;
     std::string title;
 };
 
+bool contains_iheart_attrs(std::string_view raw) {
+    return raw.find("text=") != std::string_view::npos ||
+           raw.find("song_spot=") != std::string_view::npos;
+}
+
+std::string strip_known_iheart_attrs(std::string raw) {
+    static constexpr std::array<std::string_view, 11> kAttrs = {
+        "text",       "song_spot",     "spotInstanceId", "length",
+        "MediaBaseId", "TAID",          "TPID",           "cartcutId",
+        "amgArtworkURL", "spEventID",   "amgTrackId"};
+
+    for (std::string_view key : kAttrs) {
+        size_t pos = 0;
+        while ((pos = raw.find(key, pos)) != std::string::npos) {
+            const bool left_ok =
+                pos == 0 || std::isspace(static_cast<unsigned char>(raw[pos - 1]));
+            const size_t eq = pos + key.size();
+            if (!left_ok || eq >= raw.size() || raw[eq] != '=') {
+                pos += key.size();
+                continue;
+            }
+
+            size_t end = eq + 1;
+            if (end < raw.size() && raw[end] == '"') {
+                ++end;
+                end = raw.find('"', end);
+                end = end == std::string::npos ? raw.size() : end + 1;
+            } else {
+                end = raw.find_first_of(" \t;", end);
+                end = end == std::string::npos ? raw.size() : end;
+            }
+            if (end < raw.size() && raw[end] == ';') ++end;
+            while (pos > 0 && raw[pos - 1] == ' ') --pos;
+            while (end < raw.size() && raw[end] == ' ') ++end;
+            raw.erase(pos, end - pos);
+        }
+    }
+    return trim_meta_value(trim_iheart_artist_prefix(std::move(raw)));
+}
+
 ParsedIcyTitle parse_icy_stream_title(const std::string& raw) {
     ParsedIcyTitle parsed;
+    parsed.has_iheart_attrs = contains_iheart_attrs(raw);
 
     std::string song_spot;
-    if (find_quoted_attr(raw, "song_spot", song_spot) && song_spot != "M") {
+    if (find_attr(raw, "song_spot", song_spot) && song_spot != "M") {
         parsed.has_metadata = true;
         parsed.should_apply = false;
         return parsed;
@@ -92,11 +141,16 @@ ParsedIcyTitle parse_icy_stream_title(const std::string& raw) {
 
     std::string text;
     size_t text_pos = std::string::npos;
-    if (find_quoted_attr(raw, "text", text, &text_pos)) {
+    if (find_attr(raw, "text", text, &text_pos)) {
         parsed.has_metadata = true;
         parsed.artist       = trim_iheart_artist_prefix(raw.substr(0, text_pos));
         parsed.title        = trim_meta_field(std::move(text));
         return parsed;
+    }
+
+    if (parsed.has_iheart_attrs) {
+        parsed.has_metadata = true;
+        parsed.title        = strip_known_iheart_attrs(raw);
     }
 
     return parsed;
@@ -377,6 +431,27 @@ void OnlineRadioSource::pump(RingBuffer& ring) {
             return false;
         };
 
+        const auto parse_for_apply = [&](const std::string& raw, std::string artist_fallback) {
+            ParsedIcyTitle parsed = parse_icy_stream_title(raw);
+            if (parsed.has_metadata) {
+                if (!parsed.title.empty() && parsed.artist.empty())
+                    parsed.artist = std::move(artist_fallback);
+                return parsed;
+            }
+
+            std::string cleaned = strip_known_iheart_attrs(raw);
+            split_dash(cleaned, parsed.artist, parsed.title);
+            parsed.has_metadata = true;
+            return parsed;
+        };
+
+        const auto log_iheart = [](const std::string& raw, const ParsedIcyTitle& parsed,
+                                   const char* action) {
+            if (!parsed.has_iheart_attrs) return;
+            log::info(R"([online_radio] iHeart metadata raw="{}" artist="{}" title="{}" {})",
+                      raw, parsed.artist, parsed.title, action);
+        };
+
         // commit metadata, logging only on an actual change
         const auto apply_meta = [&](const std::string& artist, const std::string& title,
                                     const char* kind) {
@@ -421,11 +496,14 @@ void OnlineRadioSource::pump(RingBuffer& ring) {
                     val_start, val_end != std::string::npos ? val_end - val_start : std::string::npos));
                 if (!raw.empty()) {
                     const auto parsed = parse_icy_stream_title(raw);
-                    if (parsed.has_metadata) {
+                    if (parsed.has_iheart_attrs) {
+                        log_iheart(raw, parsed, parsed.should_apply ? "applied" : "ignored");
+                        if (parsed.should_apply) apply_meta(parsed.artist, parsed.title, "ICY");
+                    } else if (parsed.has_metadata) {
                         if (parsed.should_apply) apply_meta(parsed.artist, parsed.title, "ICY");
                     } else {
                         std::string artist, title;
-                        split_dash(raw, artist, title);
+                        split_dash(strip_known_iheart_attrs(raw), artist, title);
                         apply_meta(artist, title, "ICY");
                     }
                 }
@@ -449,21 +527,31 @@ void OnlineRadioSource::pump(RingBuffer& ring) {
 
             if (key.find("streamtitle") != std::string::npos ||
                 key.find("icy-name") != std::string::npos) {
-                const auto parsed = parse_icy_stream_title(raw);
-                if (parsed.has_metadata) {
+                const auto parsed = parse_for_apply(raw, {});
+                if (parsed.has_iheart_attrs) {
+                    log_iheart(raw, parsed, parsed.should_apply ? "applied" : "ignored");
                     if (parsed.should_apply) apply_meta(parsed.artist, parsed.title, "Tag");
-                } else {
-                    std::string artist, title;
-                    split_dash(raw, artist, title);
-                    apply_meta(artist, title, "Tag");
+                } else if (parsed.has_metadata) {
+                    if (parsed.should_apply) apply_meta(parsed.artist, parsed.title, "Tag");
                 }
             } else if (key == "title" || key == "tit2") {
                 // keep any artist already parsed when this tag has no "Artist - Title" form
-                std::string artist = current_artist_, title;
-                split_dash(raw, artist, title);
-                apply_meta(artist, title, "Tag");
+                auto parsed = parse_for_apply(raw, current_artist_);
+                if (parsed.has_iheart_attrs) {
+                    log_iheart(raw, parsed, parsed.should_apply ? "applied" : "ignored");
+                }
+                if (parsed.should_apply) apply_meta(parsed.artist, parsed.title, "Tag");
             } else if (key == "artist" || key == "tpe1") {
-                apply_meta(raw, current_title_, "Tag");
+                auto parsed = parse_for_apply(raw, {});
+                if (parsed.has_iheart_attrs) {
+                    parsed.title = current_title_;
+                    log_iheart(raw, parsed, parsed.should_apply ? "applied" : "ignored");
+                }
+                if (parsed.should_apply) {
+                    std::string artist = parsed.artist.empty() ? strip_known_iheart_attrs(raw)
+                                                               : parsed.artist;
+                    apply_meta(artist, current_title_, "Tag");
+                }
             }
         }
 

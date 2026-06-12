@@ -21,11 +21,14 @@
 #include <windows.h>
 #include <sddl.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -70,16 +73,74 @@ struct ProxyData {
     ProxyData(HANDLE s, HANDLE d, std::wstring n) : source(s), dest(d), name(std::move(n)) {}
 };
 
+struct MetaSink {
+    HANDLE dest = nullptr;
+    std::wstring name;
+    std::mutex mu;
+    bool connected = false;
+    std::atomic<bool> stop{false};
+
+    MetaSink(HANDLE d, std::wstring n) : dest(d), name(std::move(n)) {}
+
+    bool ensure_connected() {
+        std::scoped_lock lk{mu};
+        if (connected) return true;
+        if (stop.load(std::memory_order_acquire)) return false;
+        BOOL ok = ConnectNamedPipe(dest, nullptr)
+                      ? TRUE
+                      : (GetLastError() == ERROR_PIPE_CONNECTED);
+        connected = ok != FALSE;
+        return connected;
+    }
+
+    void write(std::string_view bytes) {
+        if (bytes.empty() || !ensure_connected()) return;
+        std::scoped_lock lk{mu};
+        if (stop.load(std::memory_order_acquire)) return;
+        DWORD written = 0;
+        WriteFile(dest, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    }
+
+    void unblock() {
+        stop.store(true, std::memory_order_release);
+        if (dest) DisconnectNamedPipe(dest);
+        if (HANDLE c = CreateFileW(name.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0,
+                                   nullptr);
+            c != INVALID_HANDLE_VALUE)
+            CloseHandle(c);
+    }
+
+    ~MetaSink() {
+        unblock();
+        if (dest) {
+            CloseHandle(dest);
+            dest = nullptr;
+        }
+    }
+};
+
+struct MetaProxyData {
+    HANDLE source = nullptr;
+    MetaSink* sink = nullptr;
+    std::string prefix;
+    bool raw = false;
+    std::atomic<bool> stop{false};
+};
+
 struct Pipeline {
     uint32_t id = 0;
     HANDLE job  = nullptr;
     std::vector<HANDLE> processes;
     std::vector<std::unique_ptr<ProxyData>> proxies_data;
     std::vector<std::thread> proxies;
+    std::unique_ptr<MetaSink> meta_sink;
+    std::vector<std::unique_ptr<MetaProxyData>> meta_proxies_data;
+    std::vector<std::thread> meta_proxies;
 
     void kill() {
         // 1. Tell the proxies to stop touching their pipes.
         for (auto& pd : proxies_data) pd->stop.store(true, std::memory_order_release);
+        for (auto& pd : meta_proxies_data) pd->stop.store(true, std::memory_order_release);
 
         // 2. Reap the child trees -- this is what unblocks a proxy parked in
         //    ReadFile(source). yt-dlp (PyInstaller) survives a bare
@@ -101,11 +162,15 @@ struct Pipeline {
                 c != INVALID_HANDLE_VALUE)
                 CloseHandle(c);
         }
+        if (meta_sink) meta_sink->unblock();
 
         // 4. Join -- after this we are the sole owner of every proxy handle.
         for (auto& t : proxies)
             if (t.joinable()) t.join();
         proxies.clear();
+        for (auto& t : meta_proxies)
+            if (t.joinable()) t.join();
+        meta_proxies.clear();
 
         // 5. Close the pipes (no races now: the proxies have all exited).
         for (auto& pd : proxies_data) {
@@ -114,12 +179,18 @@ struct Pipeline {
             CloseHandle(pd->source);
         }
         proxies_data.clear();
+        for (auto& pd : meta_proxies_data) {
+            if (pd->source) CloseHandle(pd->source);
+        }
+        meta_proxies_data.clear();
+        meta_sink.reset();
     }
 
     ~Pipeline() { kill(); }
 };
 
 std::mutex g_mu;
+std::mutex g_env_mu;
 std::unordered_map<uint32_t, std::unique_ptr<Pipeline>> g_pipelines;
 
 // Kill every child tree, then terminate the worker. Called on an explicit
@@ -160,6 +231,37 @@ void proxy_thread_fn(ProxyData* d) {
     }
 }
 
+void meta_proxy_thread_fn(MetaProxyData* d) {
+    char buf[2048];
+    std::string pending;
+    while (!d->stop.load(std::memory_order_acquire)) {
+        DWORD got = 0;
+        if (!ReadFile(d->source, buf, sizeof(buf), &got, nullptr) || got == 0) break;
+        if (d->raw) {
+            d->sink->write({buf, got});
+            continue;
+        }
+
+        pending.append(buf, got);
+        size_t pos = 0;
+        while ((pos = pending.find('\n')) != std::string::npos) {
+            std::string line = d->prefix + pending.substr(0, pos + 1);
+            pending.erase(0, pos + 1);
+            d->sink->write(line);
+        }
+        if (pending.size() > 8192) {
+            d->sink->write(d->prefix);
+            d->sink->write(pending);
+            pending.clear();
+        }
+    }
+    if (!pending.empty() && !d->stop.load(std::memory_order_acquire)) {
+        d->sink->write(d->prefix);
+        d->sink->write(pending);
+        d->sink->write("\n");
+    }
+}
+
 HANDLE create_stream_pipe(const std::wstring& name, DWORD out_buffer_size = 1 << 20) {
     return CreateNamedPipeW(name.c_str(), PIPE_ACCESS_OUTBOUND, // server writes, client reads
                             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
@@ -196,6 +298,13 @@ json handle_spawn(const json& req) {
     if (capture_stderr_meta && meta_stderr_idx == -1) {
         meta_stderr_idx = static_cast<int>(chain.size() - 1);
     }
+    std::vector<int> meta_stderr_indices;
+    if (req.contains("meta_stderr_indices")) {
+        meta_stderr_indices = req.at("meta_stderr_indices").get<std::vector<int>>();
+    } else if (meta_stderr_idx >= 0) {
+        meta_stderr_indices.push_back(meta_stderr_idx);
+    }
+    const int raw_meta_stderr_idx = req.value("raw_meta_stderr_idx", meta_stderr_idx);
 
     DWORD out_buf_size = req.value("out_buffer_size", 1 << 20);
     if (out_buf_size == 0) out_buf_size = 1 << 20;
@@ -210,8 +319,42 @@ json handle_spawn(const json& req) {
     // Build the chain: each command's stdout feeds the next command's stdin.
     // The last command's stdout goes to a named pipe for the DLL to read.
     HANDLE prev_read = nul_in; // first command reads from NUL
-    HANDLE meta_err_rd = nullptr;
     json resp = {{"ok", true}};
+
+    if (!meta_stderr_indices.empty()) {
+        auto meta_name = stream_pipe_name(g_token, id, L"meta");
+        HANDLE mnp     = create_stream_pipe(meta_name, 1 << 16);
+        if (mnp != INVALID_HANDLE_VALUE) {
+            resp["meta_pipe"] = narrow(meta_name);
+            pl->meta_sink     = std::make_unique<MetaSink>(mnp, std::move(meta_name));
+        }
+    }
+
+    std::unique_lock env_lk{g_env_mu};
+    std::map<std::wstring, std::wstring> old_env;
+    if (req.contains("env") && req["env"].is_object()) {
+        for (const auto& [k, v] : req["env"].items()) {
+            std::wstring wk = widen(k);
+            DWORD need = GetEnvironmentVariableW(wk.c_str(), nullptr, 0);
+            if (need > 0) {
+                std::wstring old(need, L'\0');
+                DWORD got = GetEnvironmentVariableW(wk.c_str(), old.data(), need);
+                if (got > 0 && got < need) {
+                    old.resize(got);
+                    old_env[wk] = old;
+                }
+            } else {
+                old_env[wk] = {};
+            }
+            SetEnvironmentVariableW(wk.c_str(), widen(v.get<std::string>()).c_str());
+        }
+    }
+
+    auto restore_env = [&] {
+        for (const auto& [k, v] : old_env) {
+            SetEnvironmentVariableW(k.c_str(), v.empty() ? nullptr : v.c_str());
+        }
+    };
 
     for (size_t i = 0; i < chain.size(); ++i) {
         bool is_last = (i == chain.size() - 1);
@@ -219,10 +362,10 @@ json handle_spawn(const json& req) {
         SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
         HANDLE rd = nullptr, wr = nullptr;
         if (!CreatePipe(&rd, &wr, &sa, out_buf_size)) {
+            restore_env();
             if (prev_read != nul_in) CloseHandle(prev_read);
             if (nul_in) CloseHandle(nul_in);
             if (err_log) CloseHandle(err_log);
-            if (meta_err_rd) CloseHandle(meta_err_rd);
             return {{"ok", false}, {"error", "CreatePipe failed"}};
         }
 
@@ -233,7 +376,11 @@ json handle_spawn(const json& req) {
         if (is_last) SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
 
         HANDLE cmd_err = err_log;
-        bool capture_this_meta = (static_cast<int>(i) == meta_stderr_idx);
+        bool capture_this_meta =
+            std::find(meta_stderr_indices.begin(), meta_stderr_indices.end(),
+                      static_cast<int>(i)) != meta_stderr_indices.end() &&
+            pl->meta_sink;
+        HANDLE meta_err_rd = nullptr;
         
         if (capture_this_meta) {
             HANDLE err_wr = nullptr;
@@ -255,6 +402,7 @@ json handle_spawn(const json& req) {
         if (prev_read != nul_in) CloseHandle(prev_read);
 
         if (!proc) {
+            restore_env();
             CloseHandle(rd);
             if (meta_err_rd) CloseHandle(meta_err_rd);
             if (nul_in) CloseHandle(nul_in);
@@ -263,12 +411,22 @@ json handle_spawn(const json& req) {
         }
         pl->processes.push_back(proc);
 
+        if (meta_err_rd && pl->meta_sink) {
+            auto mp = std::make_unique<MetaProxyData>();
+            mp->source = meta_err_rd;
+            mp->sink   = pl->meta_sink.get();
+            mp->raw    = static_cast<int>(i) == raw_meta_stderr_idx;
+            if (!mp->raw) mp->prefix = "[worker][stderr step " + std::to_string(i) + "] ";
+            pl->meta_proxies_data.push_back(std::move(mp));
+            pl->meta_proxies.emplace_back(meta_proxy_thread_fn, pl->meta_proxies_data.back().get());
+        }
+
         if (is_last) {
             auto pipe_name = stream_pipe_name(g_token, id, L"pcm");
             HANDLE np      = create_stream_pipe(pipe_name, out_buf_size);
             if (np == INVALID_HANDLE_VALUE) {
+                restore_env();
                 CloseHandle(rd);
-                if (meta_err_rd) CloseHandle(meta_err_rd);
                 if (nul_in) CloseHandle(nul_in);
                 if (err_log) CloseHandle(err_log);
                 return {{"ok", false}, {"error", "CreateNamedPipe failed for pcm"}};
@@ -278,26 +436,17 @@ json handle_spawn(const json& req) {
             pl->proxies_data.push_back(std::make_unique<ProxyData>(rd, np, std::move(pipe_name)));
             pl->proxies.emplace_back(proxy_thread_fn, pl->proxies_data.back().get());
         
-            if (meta_err_rd) {
-                auto meta_name = stream_pipe_name(g_token, id, L"meta");
-                HANDLE mnp     = create_stream_pipe(meta_name, 1 << 16);
-                if (mnp != INVALID_HANDLE_VALUE) {
-                    resp["meta_pipe"] = narrow(meta_name);
-                    pl->proxies_data.push_back(
-                        std::make_unique<ProxyData>(meta_err_rd, mnp, std::move(meta_name)));
-                    pl->proxies.emplace_back(proxy_thread_fn, pl->proxies_data.back().get());
-                } else {
-                    CloseHandle(meta_err_rd);
-                }
-            }
         } else {
             prev_read = rd; // feed to next command's stdin
         }
     }
+    restore_env();
+    env_lk.unlock();
 
     // Optional side command (title resolver): its stdout goes to a separate
     // named pipe so the DLL can drain metadata independently.
-    if (req.contains("side_cmd") && !req.at("side_cmd").get<std::string>().empty() && !meta_err_rd) {
+    if (req.contains("side_cmd") && !req.at("side_cmd").get<std::string>().empty() &&
+        !pl->meta_sink) {
         auto side_u8 = req.at("side_cmd").get<std::string>();
         SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
         HANDLE srd = nullptr, swr = nullptr;
@@ -330,6 +479,25 @@ json handle_spawn(const json& req) {
     std::scoped_lock lk{g_mu};
     g_pipelines[id] = std::move(pl);
     return resp;
+}
+
+json handle_status(const json& req) {
+    uint32_t id = req.at("id").get<uint32_t>();
+    std::scoped_lock lk{g_mu};
+    auto it = g_pipelines.find(id);
+    if (it == g_pipelines.end()) return {{"ok", false}, {"error", "pipeline not found"}};
+
+    std::ostringstream os;
+    for (size_t i = 0; i < it->second->processes.size(); ++i) {
+        DWORD ec = 0;
+        if (GetExitCodeProcess(it->second->processes[i], &ec)) {
+            if (i) os << ", ";
+            os << "step " << i << "=";
+            if (ec == STILL_ACTIVE) os << "running";
+            else os << "exit " << ec;
+        }
+    }
+    return {{"ok", true}, {"status", os.str()}};
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +541,8 @@ void serve_connection(HANDLE pipe) {
                 resp = handle_spawn(msg);
             } else if (op == "kill") {
                 resp = handle_kill(msg);
+            } else if (op == "status") {
+                resp = handle_status(msg);
             } else {
                 resp = {{"ok", false}, {"error", "unknown op"}};
             }

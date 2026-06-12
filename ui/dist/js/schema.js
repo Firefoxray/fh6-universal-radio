@@ -62,6 +62,8 @@ export const SCHEMA = [
       ["enabled", "Enabled", "checkbox"],
       ["librespot_path", "librespot.exe path", "text"],
       ["cache_dir", "Cache directory", "text"],
+      ["bitrate", "Bitrate", "number", 96, 320, 1],
+      ["audio_cache", "Audio cache", "checkbox"],
     ],
   ],
   [

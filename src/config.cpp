@@ -124,6 +124,9 @@ Config load_config(const std::filesystem::path& path) {
     if (sp.contains("cache_dir")) {
         cfg.spotify.cache_dir = pick_path(sp, "cache_dir");
     }
+    cfg.spotify.bitrate = pick<int>(sp, "bitrate", cfg.spotify.bitrate);
+    if (cfg.spotify.bitrate <= 0) cfg.spotify.bitrate = 160;
+    cfg.spotify.audio_cache = pick<bool>(sp, "audio_cache", cfg.spotify.audio_cache);
 
     const auto& jf          = section(root, "jellyfin");
     cfg.jellyfin.enabled    = pick<bool>(jf, "enabled", cfg.jellyfin.enabled);
@@ -350,6 +353,8 @@ void save_config(const std::filesystem::path& path, const Config& cfg) {
     e.kv("enabled", cfg.spotify.enabled);
     e.kv_path("librespot_path", cfg.spotify.librespot_path);
     e.kv_path("cache_dir", cfg.spotify.cache_dir);
+    e.kv("bitrate", (int64_t)cfg.spotify.bitrate);
+    e.kv("audio_cache", cfg.spotify.audio_cache);
 
     e.header("online_radio");
     e.kv("enabled", cfg.online_radio.enabled);

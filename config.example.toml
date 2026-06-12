@@ -59,6 +59,8 @@ media_session_id = ''
 enabled            = false
 librespot_path     = ''                # blank = auto-download to fh6-radio/bin (else `librespot` on PATH)
 cache_dir          = 'spotify_cache'   # folder to save the Spotify Connect auth data
+bitrate            = 160               # kbps; lower is more reliable on marginal Spotify streams
+audio_cache        = true              # let librespot cache audio chunks
 
 [online_radio]
 enabled               = true

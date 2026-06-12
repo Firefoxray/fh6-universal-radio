@@ -183,7 +183,10 @@ WorkerClient::SpawnResult WorkerClient::spawn_pipeline(const std::vector<std::ws
                                                        const std::wstring& side_cmd,
                                                        bool capture_stderr_meta,
                                                        int meta_stderr_idx,
-                                                       uint32_t out_buffer_size) {
+                                                       uint32_t out_buffer_size,
+                                                       const std::map<std::wstring, std::wstring>& env,
+                                                       const std::vector<int>& meta_stderr_indices,
+                                                       int raw_meta_stderr_idx) {
     SpawnResult out;
     if (token_.empty()) return out;
 
@@ -198,6 +201,13 @@ WorkerClient::SpawnResult WorkerClient::spawn_pipeline(const std::vector<std::ws
     if (capture_stderr_meta) req["capture_stderr_meta"] = true;
     if (meta_stderr_idx >= 0) req["meta_stderr_idx"] = meta_stderr_idx;
     if (out_buffer_size > 0) req["out_buffer_size"] = out_buffer_size;
+    if (!env.empty()) {
+        json jenv = json::object();
+        for (const auto& [k, v] : env) jenv[subprocess::narrow(k)] = subprocess::narrow(v);
+        req["env"] = std::move(jenv);
+    }
+    if (!meta_stderr_indices.empty()) req["meta_stderr_indices"] = meta_stderr_indices;
+    if (raw_meta_stderr_idx >= 0) req["raw_meta_stderr_idx"] = raw_meta_stderr_idx;
 
     auto resp_str = request(req.dump());
     if (resp_str.empty()) return out;
@@ -244,6 +254,20 @@ void WorkerClient::kill_pipeline(uint32_t id) {
     // of ms -- waiting for it would reintroduce the stutter the worker removes.
     // The worker reaps on its own; an unread reply is harmless.
     request(json({{"op", "kill"}, {"id", id}}).dump(), /*want_response=*/false);
+}
+
+std::string WorkerClient::pipeline_status(uint32_t id) const {
+    auto resp_str = request(json({{"op", "status"}, {"id", id}}).dump());
+    if (resp_str.empty()) return {};
+
+    try {
+        auto resp = json::parse(resp_str);
+        if (!resp.value("ok", false)) return resp.value("error", "");
+        return resp.value("status", "");
+    } catch (...) {
+        log::warn("[worker] malformed status response");
+    }
+    return {};
 }
 
 } // namespace fh6::worker

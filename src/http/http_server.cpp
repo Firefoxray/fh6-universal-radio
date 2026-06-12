@@ -183,6 +183,8 @@ json config_to_json(const Config& c) {
              {"enabled", c.spotify.enabled},
              {"librespot_path", path_s(c.spotify.librespot_path)},
              {"cache_dir", path_s(c.spotify.cache_dir)},
+             {"bitrate", c.spotify.bitrate},
+             {"audio_cache", c.spotify.audio_cache},
          }},
          {"online_radio",
          json{
@@ -307,6 +309,9 @@ void apply_patch(Config& c, const json& j) {
         c.spotify.enabled        = pull(*it, "enabled", c.spotify.enabled);
         c.spotify.librespot_path = pull_path(*it, "librespot_path", c.spotify.librespot_path);
         c.spotify.cache_dir      = pull_path(*it, "cache_dir", c.spotify.cache_dir);
+        c.spotify.bitrate        = pull(*it, "bitrate", c.spotify.bitrate);
+        if (c.spotify.bitrate <= 0) c.spotify.bitrate = 160;
+        c.spotify.audio_cache    = pull(*it, "audio_cache", c.spotify.audio_cache);
     }
     if (auto it = j.find("online_radio"); it != j.end()) {
         c.online_radio.enabled = pull(*it, "enabled", c.online_radio.enabled);

@@ -104,6 +104,8 @@ struct SpotifyConfig {
     bool enabled = false;
     std::filesystem::path librespot_path; // empty = look up on PATH
     std::filesystem::path cache_dir = "spotify_cache";
+    int bitrate = 160; // kbps
+    bool audio_cache = true;
 };
 
 struct Config {

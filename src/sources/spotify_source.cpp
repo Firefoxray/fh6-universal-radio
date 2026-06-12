@@ -8,7 +8,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -28,9 +30,12 @@ using subprocess::stderr_log_path;
 constexpr uint64_t kBytesPerMs        = 192;
 constexpr std::size_t kMaxBufferBytes = 28800; // 150 ms of in-flight PCM
 constexpr std::size_t kPipeChunk      = 4096;  // OS-minimum pipe / read granularity
+constexpr DWORD kSpotifyPipeBuffer    = 64 * 1024;
 // A track-load event arriving while the previous track is still this far from
 // its end means the user skipped inside the Spotify app -- adopt it at once.
 constexpr uint64_t kExternalSkipGuardMs = 32000;
+constexpr wchar_t kRustLog[] =
+    L"librespot_playback::player=debug,librespot_audio=debug,librespot_core=warn,librespot=warn";
 
 // Press-and-release one extended media key (next/prev fallback).
 void send_media_key(WORD vk) {
@@ -55,6 +60,49 @@ std::string unescape_debug(const std::string& s) {
     return out;
 }
 
+void trim_in_place(std::string& s) {
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' ||
+                          s.back() == '\t'))
+        s.pop_back();
+    size_t first = 0;
+    while (first < s.size() && (s[first] == '\r' || s[first] == '\n' || s[first] == ' ' ||
+                                s[first] == '\t'))
+        ++first;
+    if (first) s.erase(0, first);
+}
+
+std::string first_line(std::string s) {
+    trim_in_place(s);
+    if (const size_t nl = s.find_first_of("\r\n"); nl != std::string::npos) s.erase(nl);
+    trim_in_place(s);
+    return s;
+}
+
+std::string capture_short(worker::WorkerClient* worker, const std::wstring& cmd,
+                          bool capture_stderr = false) {
+    if (worker && worker->alive()) return worker->run_capture(cmd, capture_stderr);
+    return subprocess::capture_output(cmd, capture_stderr, 64 * 1024);
+}
+
+bool contains(std::string_view haystack, std::string_view needle) {
+    return haystack.find(needle) != std::string_view::npos;
+}
+
+struct LibrespotProbe {
+    std::string version;
+    bool supports_passthrough = false;
+};
+
+LibrespotProbe probe_librespot(worker::WorkerClient* worker, const std::wstring& spot) {
+    LibrespotProbe probe;
+    probe.version = first_line(capture_short(worker, quote(spot) + L" --version"));
+
+    std::string help = capture_short(worker, quote(spot) + L" --help");
+    if (help.empty()) help = capture_short(worker, quote(spot) + L" --help", true);
+    probe.supports_passthrough = contains(help, "--passthrough");
+    return probe;
+}
+
 } // namespace
 
 struct SpotifySource::Pipe {
@@ -70,6 +118,9 @@ struct SpotifySource::Pipe {
     HANDLE log_file = nullptr;
     std::string err_buf;
     bool ended = false;
+    bool logged_audio_available = false;
+    bool logged_first_read      = false;
+    bool logged_exit_status     = false;
 
     // tracks the total PCM bytes pumped to calculate UI time syncing
     uint64_t bytes_consumed = 0;
@@ -135,6 +186,12 @@ bool SpotifySource::initialize() {
                   ec.message());
         return false;
     }
+    std::filesystem::create_directories(cfg_.cache_dir / "tmp", ec);
+    if (ec) {
+        log::warn("[spotify] cannot create cache tmp dir {} ({})",
+                  (cfg_.cache_dir / "tmp").string(), ec.message());
+        return false;
+    }
     return true;
 }
 
@@ -179,20 +236,57 @@ void SpotifySource::start_pipe_locked() {
     const auto cache      = cfg_.cache_dir.wstring();
     const auto tmp_dir    = (cfg_.cache_dir / L"tmp").wstring();
 
-    std::wstring spot_cmd = quote(spot) + L" --name \"FH6 Universal Radio\"" + L" --bitrate 320" +
-                            L" --backend pipe" + L" --initial-volume 100" + L" --cache " +
-                            quote(cache) + L" --tmp " + quote(tmp_dir) + L" --disable-audio-cache";
+    std::error_code ec;
+    std::filesystem::create_directories(cfg_.cache_dir, ec);
+    if (ec) {
+        log::warn("[spotify] cannot create cache dir {} ({})", cfg_.cache_dir.string(),
+                  ec.message());
+        return;
+    }
+    std::filesystem::create_directories(cfg_.cache_dir / "tmp", ec);
+    if (ec) {
+        log::warn("[spotify] cannot create cache tmp dir {} ({})",
+                  (cfg_.cache_dir / "tmp").string(), ec.message());
+        return;
+    }
 
-    // librespot defaults to 44100Hz s16le. We must resample to 48000Hz for FH6.
-    // added flags to disable FFmpeg internal buffering for perfect UI sync
-    std::wstring ff_cmd = quote(ff) + L" -loglevel error" + L" -fflags nobuffer -flags low_delay" +
-                          L" -blocksize 4096" + // force micro-block processing
-                          L" -f s16le -ar 44100 -ac 2 -i pipe:0" + L" -flush_packets 1" +
-                          L" -f s16le -acodec pcm_s16le -ar 48000 -ac 2 pipe:1";
+    const int bitrate = cfg_.bitrate > 0 ? cfg_.bitrate : 160;
+    const LibrespotProbe spot_probe = probe_librespot(worker_, spot);
+    if (!spot_probe.version.empty()) {
+        log::info("[spotify] librespot version: {}", spot_probe.version);
+    } else {
+        log::warn("[spotify] could not read librespot --version from {}", subprocess::narrow(spot));
+    }
+    log::info("[spotify] librespot passthrough decoder support: {}",
+              spot_probe.supports_passthrough ? "yes" : "no");
+    if (!spot_probe.supports_passthrough) {
+        log::warn("[spotify] librespot was built without --passthrough; Spotify audio will be "
+                  "decoded by librespot/Symphonia instead of ffmpeg");
+    }
 
-    // request debug logs for the player module to intercept Seek events & metadata
-    SetEnvironmentVariableW(L"RUST_LOG",
-                            L"librespot_playback::player=debug,librespot_metadata=trace");
+    std::wstring spot_cmd = quote(spot) + L" --name \"FH6 Universal Radio\"" + L" --bitrate " +
+                            std::to_wstring(bitrate) +
+                            L" --backend pipe" + L" --format S16" + L" --dither none" +
+                            L" --initial-volume 100" + L" --cache " + quote(cache) + L" --tmp " +
+                            quote(tmp_dir);
+    if (!cfg_.audio_cache) spot_cmd += L" --disable-audio-cache";
+    if (spot_probe.supports_passthrough) spot_cmd += L" --passthrough";
+
+    // Passthrough keeps librespot out of the decode path: it writes the raw
+    // Spotify Ogg/Vorbis stream and ffmpeg handles decode + resample. Older
+    // binaries without that feature still use librespot's 44.1 kHz S16 pipe.
+    std::wstring ff_cmd = quote(ff) + L" -loglevel info";
+    if (spot_probe.supports_passthrough) {
+        ff_cmd += L" -fflags nobuffer -flags low_delay -blocksize 16384"
+                  L" -f ogg -i pipe:0";
+    } else {
+        ff_cmd += L" -fflags nobuffer -flags low_delay -blocksize 4096"
+                  L" -f s16le -ar 44100 -ac 2 -i pipe:0";
+    }
+    ff_cmd += L" -flush_packets 1 -f s16le -acodec pcm_s16le -ar 48000 -ac 2 pipe:1";
+
+    // Keep player/audio diagnostics without enabling huge metadata trace dumps.
+    SetEnvironmentVariableW(L"RUST_LOG", kRustLog);
 
     log::info("[spotify] starting librespot via {}: librespot={}, ffmpeg={}, cache={}",
               (worker_ && worker_->alive()) ? "worker" : "direct", subprocess::narrow(spot),
@@ -202,8 +296,12 @@ void SpotifySource::start_pipe_locked() {
         // spawn the pipeline via worker_client
         // use meta_stderr_idx = 0 to capture librespot stderr directly
         // skip capture_stderr_meta, which would otherwise capture ffmpeg (the last process) stderr
-        // set all pipeline buffers to 4096 bytes to minimize buffering and reduce residual backlog
-        if (auto result = worker_->spawn_pipeline({spot_cmd, ff_cmd}, L"", false, 0, 4096); result.ok) {
+        // Keep some pipe headroom here: too little buffering can back-pressure ffmpeg/librespot
+        // hard enough to look like network/decode failure under Wine.
+        const std::map<std::wstring, std::wstring> env = {{L"RUST_LOG", kRustLog}};
+        if (auto result = worker_->spawn_pipeline({spot_cmd, ff_cmd}, L"", false, -1,
+                                                  kSpotifyPipeBuffer, env, {0, 1}, 0);
+            result.ok) {
             SetEnvironmentVariableW(L"RUST_LOG", nullptr);
 
             pipe->worker      = worker_;
@@ -250,19 +348,18 @@ void SpotifySource::start_pipe_locked() {
     // spawned first; if ffmpeg's stdout write end (ff_out_w) leaked into it, the
     // read end would never see EOF when ffmpeg exits. The ffmpeg-side ends are
     // re-enabled just before ffmpeg is spawned.
-    // reduced pipe size to 4KB (OS minimum) to eliminate residual data backlog
-    if (!CreatePipe(&spot_out_r, &spot_out_w, &sa, 4096)) {
+    if (!CreatePipe(&spot_out_r, &spot_out_w, &sa, kSpotifyPipeBuffer)) {
         bail();
         return;
     }
     SetHandleInformation(spot_out_r, HANDLE_FLAG_INHERIT, 0);
     // create error pipe and ensure read end isn't passed to children
-    if (!CreatePipe(&spot_err_r, &spot_err_w, &sa, 4096)) {
+    if (!CreatePipe(&spot_err_r, &spot_err_w, &sa, kSpotifyPipeBuffer)) {
         bail();
         return;
     }
     SetHandleInformation(spot_err_r, HANDLE_FLAG_INHERIT, 0);
-    if (!CreatePipe(&ff_out_r, &ff_out_w, &sa, 4096)) {
+    if (!CreatePipe(&ff_out_r, &ff_out_w, &sa, kSpotifyPipeBuffer)) {
         bail();
         return;
     }
@@ -274,21 +371,23 @@ void SpotifySource::start_pipe_locked() {
     if (pipe->log_file && pipe->log_file != INVALID_HANDLE_VALUE)
         SetHandleInformation(pipe->log_file, HANDLE_FLAG_INHERIT, 0); // ffmpeg only, not librespot
 
-    // pass spot_err_w to librespot instead of the raw file
+    // Both children write stderr to this pipe so bridge.log sees the useful
+    // Spotify/ffmpeg diagnostics instead of only the out-of-band temp log.
     pipe->proc_spot = spawn_in_job(pipe->job, spot_cmd, nul_in, spot_out_w, spot_err_w);
     const DWORD ec_spot = pipe->proc_spot ? 0u : GetLastError();
     SetEnvironmentVariableW(L"RUST_LOG", nullptr);
-    // librespot owns its inherited stdin/stdout/stderr now; drop the parent copies.
+    // librespot owns its inherited stdin/stdout/stderr now; drop the parent
+    // stdout copy. Keep stderr write-end until ffmpeg inherits it too.
     CloseHandle(spot_out_w);
     spot_out_w = nullptr;
-    CloseHandle(spot_err_w);
-    spot_err_w = nullptr;
     if (nul_in) {
         CloseHandle(nul_in);
         nul_in = nullptr;
     }
 
     if (!pipe->proc_spot) {
+        CloseHandle(spot_err_w);
+        spot_err_w = nullptr;
         log::warn("[spotify] failed to launch librespot -- {} (check {})",
                   describe_launch_failure(std::wstring{spot}, ec_spot, !cfg_.librespot_path.empty()),
                   stderr_log_path().string());
@@ -303,8 +402,9 @@ void SpotifySource::start_pipe_locked() {
     if (pipe->log_file && pipe->log_file != INVALID_HANDLE_VALUE)
         SetHandleInformation(pipe->log_file, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 
-    // FFmpeg can keep logging to the file directly
-    pipe->proc_ff = spawn_in_job(pipe->job, ff_cmd, spot_out_r, ff_out_w, pipe->log_file);
+    SetHandleInformation(spot_err_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+
+    pipe->proc_ff = spawn_in_job(pipe->job, ff_cmd, spot_out_r, ff_out_w, spot_err_w);
     const DWORD ec_ff = pipe->proc_ff ? 0u : GetLastError();
     // log_file is long-lived; stop later CreateProcess calls from inheriting it.
     if (pipe->log_file && pipe->log_file != INVALID_HANDLE_VALUE)
@@ -313,6 +413,8 @@ void SpotifySource::start_pipe_locked() {
     spot_out_r = nullptr;
     CloseHandle(ff_out_w);
     ff_out_w = nullptr;
+    CloseHandle(spot_err_w);
+    spot_err_w = nullptr;
 
     if (!pipe->proc_ff) {
         log::warn("[spotify] failed to launch ffmpeg -- {} (check {})",
@@ -425,6 +527,8 @@ void SpotifySource::pump(RingBuffer& ring) {
 
                 // strip Windows carriage return if it exists
                 if (!line.empty() && line.back() == '\r') line.pop_back();
+
+                log::info("[spotify][child] {}", line);
 
                 // detect if the line breaks out of the multiline metadata trace
                 if (!line.empty() && line[0] == '[') {
@@ -610,6 +714,22 @@ void SpotifySource::pump(RingBuffer& ring) {
 
     DWORD avail = 0;
     if (!PeekNamedPipe(p->read_pipe, nullptr, 0, nullptr, &avail, nullptr)) {
+        if (!p->logged_exit_status) {
+            if (p->worker && p->pipeline_id) {
+                log::warn("[spotify] PCM pipe ended; worker child status: {}",
+                          p->worker->pipeline_status(p->pipeline_id));
+            } else {
+                DWORD spot_ec = 0, ff_ec = 0;
+                const bool spot_ok = p->proc_spot && GetExitCodeProcess(p->proc_spot, &spot_ec);
+                const bool ff_ok   = p->proc_ff && GetExitCodeProcess(p->proc_ff, &ff_ec);
+                log::warn("[spotify] PCM pipe ended; librespot={}, ffmpeg={}",
+                          spot_ok ? (spot_ec == STILL_ACTIVE ? "running" : std::to_string(spot_ec))
+                                  : "unknown",
+                          ff_ok ? (ff_ec == STILL_ACTIVE ? "running" : std::to_string(ff_ec))
+                                : "unknown");
+            }
+            p->logged_exit_status = true;
+        }
         p->ended = true;
         return;
     }
@@ -630,6 +750,10 @@ void SpotifySource::pump(RingBuffer& ring) {
             }
         }
     } else {
+        if (!p->logged_audio_available) {
+            log::info("[spotify] ffmpeg produced first PCM bytes ({} available)", avail);
+            p->logged_audio_available = true;
+        }
         p->stall_ticks = 0;
     }
 
@@ -663,10 +787,21 @@ void SpotifySource::pump(RingBuffer& ring) {
         std::byte buf[kPipeChunk];
         DWORD got = 0;
         if (!ReadFile(p->read_pipe, buf, static_cast<DWORD>(want), &got, nullptr) || got == 0) {
+            if (!p->logged_exit_status) {
+                if (p->worker && p->pipeline_id) {
+                    log::warn("[spotify] PCM read failed; worker child status: {}",
+                              p->worker->pipeline_status(p->pipeline_id));
+                }
+                p->logged_exit_status = true;
+            }
             p->ended = true;
             return;
         }
 
+        if (!p->logged_first_read) {
+            log::info("[spotify] read first PCM chunk from ffmpeg ({} bytes)", got);
+            p->logged_first_read = true;
+        }
         ring.write(buf, got);
         p->bytes_consumed += got; // track exact bytes pushed to the stream
         avail              = avail > got ? avail - got : 0;

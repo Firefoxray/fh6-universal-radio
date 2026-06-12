@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -54,13 +55,19 @@ public:
                                const std::wstring& side_cmd = {},
                                bool capture_stderr_meta = false,
                                int meta_stderr_idx = -1,
-                               uint32_t out_buffer_size = 0);
+                               uint32_t out_buffer_size = 0,
+                               const std::map<std::wstring, std::wstring>& env = {},
+                               const std::vector<int>& meta_stderr_indices = {},
+                               int raw_meta_stderr_idx = -1);
 
     /// Convenience: single command whose stdout is exposed as pcm_pipe.
     SpawnResult spawn_single(const std::wstring& cmd);
 
     /// Terminate all child processes of a pipeline.
     void kill_pipeline(uint32_t id);
+
+    /// Return a compact child status string for diagnostics.
+    std::string pipeline_status(uint32_t id) const;
 
 private:
     /// Open a fresh control connection, send req, optionally read the reply, close.
