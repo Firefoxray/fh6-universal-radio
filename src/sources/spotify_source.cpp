@@ -35,7 +35,8 @@ constexpr DWORD kSpotifyPipeBuffer    = 64 * 1024;
 // its end means the user skipped inside the Spotify app -- adopt it at once.
 constexpr uint64_t kExternalSkipGuardMs = 32000;
 constexpr wchar_t kRustLog[] =
-    L"librespot_playback::player=debug,librespot_audio=debug,librespot_core=warn,librespot=warn";
+    L"librespot_playback::player=debug,librespot_playback::decoder::passthrough_decoder=trace,"
+    L"librespot_audio=debug,librespot_core=warn,librespot=warn";
 
 // Press-and-release one extended media key (next/prev fallback).
 void send_media_key(WORD vk) {
@@ -266,11 +267,14 @@ void SpotifySource::start_pipe_locked() {
 
     std::wstring spot_cmd = quote(spot) + L" --name \"FH6 Universal Radio\"" + L" --bitrate " +
                             std::to_wstring(bitrate) +
-                            L" --backend pipe" + L" --format S16" + L" --dither none" +
-                            L" --initial-volume 100" + L" --cache " + quote(cache) + L" --tmp " +
-                            quote(tmp_dir);
+                            L" --backend pipe" + L" --initial-volume 100" + L" --cache " +
+                            quote(cache) + L" --tmp " + quote(tmp_dir);
     if (!cfg_.audio_cache) spot_cmd += L" --disable-audio-cache";
-    if (spot_probe.supports_passthrough) spot_cmd += L" --passthrough";
+    if (spot_probe.supports_passthrough) {
+        spot_cmd += L" --passthrough";
+    } else {
+        spot_cmd += L" --format S16 --dither none";
+    }
 
     // Passthrough keeps librespot out of the decode path: it writes the raw
     // Spotify Ogg/Vorbis stream and ffmpeg handles decode + resample. Older
@@ -278,15 +282,15 @@ void SpotifySource::start_pipe_locked() {
     std::wstring ff_cmd = quote(ff) + L" -loglevel info";
     if (spot_probe.supports_passthrough) {
         ff_cmd += L" -fflags nobuffer -flags low_delay -blocksize 16384"
-                  L" -f ogg -i pipe:0";
+                  L" -i pipe:0";
     } else {
         ff_cmd += L" -fflags nobuffer -flags low_delay -blocksize 4096"
                   L" -f s16le -ar 44100 -ac 2 -i pipe:0";
     }
     ff_cmd += L" -flush_packets 1 -f s16le -acodec pcm_s16le -ar 48000 -ac 2 pipe:1";
 
-    // Keep player/audio diagnostics without enabling huge metadata trace dumps.
-    SetEnvironmentVariableW(L"RUST_LOG", kRustLog);
+    log::info("[spotify] generated librespot command: {}", subprocess::narrow(spot_cmd));
+    log::info("[spotify] generated ffmpeg command: {}", subprocess::narrow(ff_cmd));
 
     log::info("[spotify] starting librespot via {}: librespot={}, ffmpeg={}, cache={}",
               (worker_ && worker_->alive()) ? "worker" : "direct", subprocess::narrow(spot),
@@ -373,6 +377,8 @@ void SpotifySource::start_pipe_locked() {
 
     // Both children write stderr to this pipe so bridge.log sees the useful
     // Spotify/ffmpeg diagnostics instead of only the out-of-band temp log.
+    // Keep player/audio diagnostics plus passthrough lifecycle traces.
+    SetEnvironmentVariableW(L"RUST_LOG", kRustLog);
     pipe->proc_spot = spawn_in_job(pipe->job, spot_cmd, nul_in, spot_out_w, spot_err_w);
     const DWORD ec_spot = pipe->proc_spot ? 0u : GetLastError();
     SetEnvironmentVariableW(L"RUST_LOG", nullptr);
