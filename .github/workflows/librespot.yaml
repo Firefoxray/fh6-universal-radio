@@ -2,7 +2,9 @@ name: librespot
 
 # librespot ships no official binary, so we build one and publish it to the
 # `deps` release. The mod's DependencyManager downloads from there on first run.
-# Run manually from the Actions tab after bumping LIBRESPOT_VERSION.
+# Run manually from the Actions tab after bumping LIBRESPOT_VERSION. Keep
+# passthrough-decoder enabled: the mod pipes Spotify Ogg/Vorbis into ffmpeg so
+# librespot's Symphonia decoder is not in the critical audio path.
 
 on:
   workflow_dispatch:
@@ -20,7 +22,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build librespot
-        run: cargo install librespot --version ${{ env.LIBRESPOT_VERSION }} --locked --root staging
+        run: cargo install librespot --version ${{ env.LIBRESPOT_VERSION }} --locked --features passthrough-decoder --root staging
+
+      - name: Verify passthrough-capable build
+        shell: pwsh
+        run: |
+          .\staging\bin\librespot.exe --version
+          .\staging\bin\librespot.exe --help | Select-String -- "--passthrough"
 
       - name: Stage binary
         run: copy staging\bin\librespot.exe librespot.exe
