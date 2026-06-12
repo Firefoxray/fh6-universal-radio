@@ -260,9 +260,8 @@ void SpotifySource::start_pipe_locked() {
     }
     log::info("[spotify] librespot passthrough decoder support: {}",
               spot_probe.supports_passthrough ? "yes" : "no");
-    if (!spot_probe.supports_passthrough) {
-        log::warn("[spotify] librespot was built without --passthrough; Spotify audio will be "
-                  "decoded by librespot/Symphonia instead of ffmpeg");
+    if (spot_probe.supports_passthrough) {
+        log::info("[spotify] passthrough supported but disabled for decoded PCM stability test");
     }
 
     std::wstring spot_cmd = quote(spot) + L" --name \"FH6 Universal Radio\"" + L" --bitrate " +
@@ -270,23 +269,13 @@ void SpotifySource::start_pipe_locked() {
                             L" --backend pipe" + L" --initial-volume 100" + L" --cache " +
                             quote(cache) + L" --tmp " + quote(tmp_dir);
     if (!cfg_.audio_cache) spot_cmd += L" --disable-audio-cache";
-    if (spot_probe.supports_passthrough) {
-        spot_cmd += L" --passthrough";
-    } else {
-        spot_cmd += L" --format S16 --dither none";
-    }
+    spot_cmd += L" --format S16 --dither none";
 
-    // Passthrough keeps librespot out of the decode path: it writes the raw
-    // Spotify Ogg/Vorbis stream and ffmpeg handles decode + resample. Older
-    // binaries without that feature still use librespot's 44.1 kHz S16 pipe.
+    // Decode to 44.1 kHz S16 in librespot, then let ffmpeg resample to the
+    // 48 kHz PCM contract used by the rest of the bridge.
     std::wstring ff_cmd = quote(ff) + L" -loglevel info";
-    if (spot_probe.supports_passthrough) {
-        ff_cmd += L" -fflags nobuffer -flags low_delay -blocksize 16384"
-                  L" -i pipe:0";
-    } else {
-        ff_cmd += L" -fflags nobuffer -flags low_delay -blocksize 4096"
-                  L" -f s16le -ar 44100 -ac 2 -i pipe:0";
-    }
+    ff_cmd += L" -fflags nobuffer -flags low_delay -blocksize 4096"
+              L" -f s16le -ar 44100 -ac 2 -i pipe:0";
     ff_cmd += L" -flush_packets 1 -f s16le -acodec pcm_s16le -ar 48000 -ac 2 pipe:1";
 
     log::info("[spotify] generated librespot command: {}", subprocess::narrow(spot_cmd));

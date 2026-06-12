@@ -2,9 +2,12 @@ name: librespot
 
 # librespot ships no official binary, so we build one and publish it to the
 # `deps` release. The mod's DependencyManager downloads from there on first run.
-# Run manually from the Actions tab after bumping LIBRESPOT_VERSION. Keep
-# passthrough-decoder enabled: the mod pipes Spotify Ogg/Vorbis into ffmpeg so
-# librespot's Symphonia decoder is not in the critical audio path.
+# Run manually from the Actions tab after bumping LIBRESPOT_VERSION.
+#
+# The primary published librespot.exe is the default upstream decoded-PCM build.
+# That keeps the normal librespot/Symphonia Ogg/Vorbis decoder path available for
+# `--backend pipe --format S16 --dither none`. A passthrough build is still kept
+# as a separate artifact/asset for experiments that pipe Ogg/Vorbis externally.
 
 on:
   workflow_dispatch:
@@ -21,26 +24,67 @@ jobs:
     steps:
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build librespot
-        run: cargo install librespot --version ${{ env.LIBRESPOT_VERSION }} --locked --features passthrough-decoder --root staging
+      - name: Build decoded PCM librespot
+        shell: pwsh
+        run: |
+          Write-Host "cargo install librespot --version $env:LIBRESPOT_VERSION --locked --root staging-decoded-pcm"
+          cargo install librespot --version $env:LIBRESPOT_VERSION --locked --root staging-decoded-pcm
+
+      - name: Verify decoded PCM build
+        shell: pwsh
+        run: |
+          .\staging-decoded-pcm\bin\librespot.exe --version
+          $help = .\staging-decoded-pcm\bin\librespot.exe --help
+          foreach ($needle in "--backend", "--format", "--dither") {
+            if (-not ($help | Select-String -SimpleMatch $needle -Quiet)) {
+              throw "Decoded PCM build is missing $needle"
+            }
+          }
+          if ($help | Select-String -SimpleMatch "--passthrough" -Quiet) {
+            throw "Decoded PCM build unexpectedly exposes --passthrough"
+          }
+
+      - name: Build passthrough librespot
+        shell: pwsh
+        run: |
+          Write-Host "cargo install librespot --version $env:LIBRESPOT_VERSION --locked --features passthrough-decoder --root staging-passthrough"
+          cargo install librespot --version $env:LIBRESPOT_VERSION --locked --features passthrough-decoder --root staging-passthrough
 
       - name: Verify passthrough-capable build
         shell: pwsh
         run: |
-          .\staging\bin\librespot.exe --version
-          .\staging\bin\librespot.exe --help | Select-String -- "--passthrough"
+          .\staging-passthrough\bin\librespot.exe --version
+          $help = .\staging-passthrough\bin\librespot.exe --help
+          if (-not ($help | Select-String -SimpleMatch "--passthrough" -Quiet)) {
+            throw "Passthrough build is missing --passthrough"
+          }
 
-      - name: Stage binary
-        run: copy staging\bin\librespot.exe librespot.exe
+      - name: Stage binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts\decoded-pcm, artifacts\passthrough, artifacts\release
+          Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\decoded-pcm\librespot.exe
+          Copy-Item staging-passthrough\bin\librespot.exe artifacts\passthrough\librespot.exe
+          Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\release\librespot.exe
+          Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\release\librespot-decoded-pcm.exe
+          Copy-Item staging-passthrough\bin\librespot.exe artifacts\release\librespot-passthrough.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: librespot-windows-decoded-pcm
+          path: artifacts/decoded-pcm/librespot.exe
 
       - uses: actions/upload-artifact@v4
         with:
           name: librespot
-          path: librespot.exe
+          path: artifacts/passthrough/librespot.exe
 
       - name: Publish to deps release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: deps
           name: Provider dependencies
-          files: librespot.exe
+          files: |
+            artifacts/release/librespot.exe
+            artifacts/release/librespot-decoded-pcm.exe
+            artifacts/release/librespot-passthrough.exe
