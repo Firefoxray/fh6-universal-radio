@@ -12,6 +12,8 @@ name: librespot
 # container/decoder coverage without changing the app-side no-passthrough path.
 # A force-zero-position decoded-PCM artifact is built from patched source to
 # ignore Spotify Connect resume/load offsets while keeping decoded PCM output.
+# A force-zero-position passthrough artifact combines that Spotify Connect load
+# offset patch with external Ogg/Vorbis decoding through ffmpeg.
 
 on:
   workflow_dispatch:
@@ -155,14 +157,56 @@ jobs:
             throw "Passthrough build is missing --passthrough"
           }
 
+      - name: Build passthrough librespot with forced zero load positions
+        shell: pwsh
+        run: |
+          git clone --branch "v$env:LIBRESPOT_VERSION" --depth 1 https://github.com/librespot-org/librespot.git librespot-passthrough-force-zero-position
+
+          $spirc = "librespot-passthrough-force-zero-position\connect\src\spirc.rs"
+          $text = Get-Content $spirc -Raw
+          $needle = '        self.player.load(id, start_playing, position_ms);'
+          $matches = [regex]::Matches($text, [regex]::Escape($needle))
+          if ($matches.Count -ne 1) {
+            throw "Expected exactly one Spotify player.load call in connect/src/spirc.rs, found $($matches.Count)"
+          }
+
+          $replacement = @'
+                  let original_position_ms = position_ms;
+                  let position_ms = 0;
+                  if original_position_ms != position_ms {
+                      info!(
+                          "FH6 patch: forcing Spotify load position from {original_position_ms}ms to 0ms"
+                      );
+                  }
+                  self.player.load(id, start_playing, position_ms);
+          '@
+          $patched = $text.Replace($needle, $replacement.TrimEnd("`r`n".ToCharArray()))
+          Set-Content -Path $spirc -Value $patched -NoNewline
+          git -C librespot-passthrough-force-zero-position diff -- connect/src/spirc.rs
+
+          Push-Location librespot-passthrough-force-zero-position
+          Write-Host "cargo install --path . --locked --features passthrough-decoder --root ..\staging-passthrough-force-zero-position"
+          cargo install --path . --locked --features passthrough-decoder --root ..\staging-passthrough-force-zero-position
+          Pop-Location
+
+      - name: Verify force-zero-position passthrough build
+        shell: pwsh
+        run: |
+          .\staging-passthrough-force-zero-position\bin\librespot.exe --version
+          $help = .\staging-passthrough-force-zero-position\bin\librespot.exe --help
+          if (-not ($help | Select-String -SimpleMatch "--passthrough" -Quiet)) {
+            throw "Force-zero-position passthrough build is missing --passthrough"
+          }
+
       - name: Stage binaries
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force artifacts\decoded-pcm, artifacts\force-zero-position, artifacts\full-symphonia, artifacts\passthrough, artifacts\release
+          New-Item -ItemType Directory -Force artifacts\decoded-pcm, artifacts\force-zero-position, artifacts\full-symphonia, artifacts\passthrough, artifacts\passthrough-force-zero-position, artifacts\release
           Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\decoded-pcm\librespot.exe
           Copy-Item staging-force-zero-position\bin\librespot.exe artifacts\force-zero-position\librespot.exe
           Copy-Item staging-full-symphonia\bin\librespot.exe artifacts\full-symphonia\librespot.exe
           Copy-Item staging-passthrough\bin\librespot.exe artifacts\passthrough\librespot.exe
+          Copy-Item staging-passthrough-force-zero-position\bin\librespot.exe artifacts\passthrough-force-zero-position\librespot.exe
           Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\release\librespot.exe
           Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\release\librespot-decoded-pcm.exe
           Copy-Item staging-passthrough\bin\librespot.exe artifacts\release\librespot-passthrough.exe
@@ -186,6 +230,11 @@ jobs:
         with:
           name: librespot
           path: artifacts/passthrough/librespot.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: librespot-windows-passthrough-force-zero-position
+          path: artifacts/passthrough-force-zero-position/librespot.exe
 
       - name: Publish to deps release
         uses: softprops/action-gh-release@v2
