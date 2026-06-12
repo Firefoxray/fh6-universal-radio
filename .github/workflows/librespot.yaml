@@ -10,6 +10,8 @@ name: librespot
 # as a separate artifact/asset for experiments that pipe Ogg/Vorbis externally.
 # A full-Symphonia decoded-PCM artifact is built from patched source for probing
 # container/decoder coverage without changing the app-side no-passthrough path.
+# A force-zero-position decoded-PCM artifact is built from patched source to
+# ignore Spotify Connect resume/load offsets while keeping decoded PCM output.
 
 on:
   workflow_dispatch:
@@ -44,6 +46,52 @@ jobs:
           }
           if ($help | Select-String -SimpleMatch "--passthrough" -Quiet) {
             throw "Decoded PCM build unexpectedly exposes --passthrough"
+          }
+
+      - name: Build decoded PCM librespot with forced zero load positions
+        shell: pwsh
+        run: |
+          git clone --branch "v$env:LIBRESPOT_VERSION" --depth 1 https://github.com/librespot-org/librespot.git librespot-force-zero-position
+
+          $spirc = "librespot-force-zero-position\connect\src\spirc.rs"
+          $text = Get-Content $spirc -Raw
+          $needle = '        self.player.load(id, start_playing, position_ms);'
+          $matches = [regex]::Matches($text, [regex]::Escape($needle))
+          if ($matches.Count -ne 1) {
+            throw "Expected exactly one Spotify player.load call in connect/src/spirc.rs, found $($matches.Count)"
+          }
+
+          $replacement = @'
+                  let original_position_ms = position_ms;
+                  let position_ms = 0;
+                  if original_position_ms != position_ms {
+                      info!(
+                          "FH6 patch: forcing Spotify load position from {original_position_ms}ms to 0ms"
+                      );
+                  }
+                  self.player.load(id, start_playing, position_ms);
+          '@
+          $patched = $text.Replace($needle, $replacement.TrimEnd("`r`n".ToCharArray()))
+          Set-Content -Path $spirc -Value $patched -NoNewline
+          git -C librespot-force-zero-position diff -- connect/src/spirc.rs
+
+          Push-Location librespot-force-zero-position
+          Write-Host "cargo install --path . --locked --root ..\staging-force-zero-position"
+          cargo install --path . --locked --root ..\staging-force-zero-position
+          Pop-Location
+
+      - name: Verify force-zero-position decoded PCM build
+        shell: pwsh
+        run: |
+          .\staging-force-zero-position\bin\librespot.exe --version
+          $help = .\staging-force-zero-position\bin\librespot.exe --help
+          foreach ($needle in "--backend", "--format", "--dither") {
+            if (-not ($help | Select-String -SimpleMatch $needle -Quiet)) {
+              throw "Force-zero-position decoded PCM build is missing $needle"
+            }
+          }
+          if ($help | Select-String -SimpleMatch "--passthrough" -Quiet) {
+            throw "Force-zero-position decoded PCM build unexpectedly exposes --passthrough"
           }
 
       - name: Build decoded PCM librespot with expanded Symphonia support
@@ -110,8 +158,9 @@ jobs:
       - name: Stage binaries
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force artifacts\decoded-pcm, artifacts\full-symphonia, artifacts\passthrough, artifacts\release
+          New-Item -ItemType Directory -Force artifacts\decoded-pcm, artifacts\force-zero-position, artifacts\full-symphonia, artifacts\passthrough, artifacts\release
           Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\decoded-pcm\librespot.exe
+          Copy-Item staging-force-zero-position\bin\librespot.exe artifacts\force-zero-position\librespot.exe
           Copy-Item staging-full-symphonia\bin\librespot.exe artifacts\full-symphonia\librespot.exe
           Copy-Item staging-passthrough\bin\librespot.exe artifacts\passthrough\librespot.exe
           Copy-Item staging-decoded-pcm\bin\librespot.exe artifacts\release\librespot.exe
@@ -122,6 +171,11 @@ jobs:
         with:
           name: librespot-windows-decoded-pcm
           path: artifacts/decoded-pcm/librespot.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: librespot-windows-decoded-pcm-force-zero-position
+          path: artifacts/force-zero-position/librespot.exe
 
       - uses: actions/upload-artifact@v4
         with:
